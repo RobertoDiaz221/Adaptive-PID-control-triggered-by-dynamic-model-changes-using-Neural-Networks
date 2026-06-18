@@ -1,5 +1,5 @@
 # 🚀 Adaptive PID control triggered by dynamic model changes using Neural Networks
-DOI:  10.5281/zenodo.20736652
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20736652.svg)](https://doi.org/10.5281/zenodo.20736652)
 
 This repository presents the implementation of an advanced control strategy for omnidirectional mobile robots (KUKA youBot). The core contribution is a **Single-Neuron PID Controller (SNPID)** whose gains are dynamically tuned through an **Extended Kalman Filter (EKF)**. The controller is designed to handle actuator saturation, moving obstacles, trajectory interruptions, and sudden payload variations.
 
