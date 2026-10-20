@@ -62,6 +62,9 @@ An Exponentially Weighted Moving Average (EWMA) filter is used to avoid reaction
 * `comparativatrayectoriapausa.m`
   Generates comparative performance metrics for interruption scenarios caused by moving obstacles.
 
+* `comparativaruido.m`
+  Generates comparative performance metrics for trajectory tracking under noisy conditions.
+
 ---
 
 ### Python Artificial Intelligence Modules
