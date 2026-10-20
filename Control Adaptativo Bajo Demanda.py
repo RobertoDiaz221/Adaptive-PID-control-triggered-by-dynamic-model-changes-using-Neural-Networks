@@ -20,14 +20,13 @@ ML_SWITCH_T   = None              # Time of mass switch (None = S/2)
 ML_EPS        = 1e-6              # Fallback epsilon for minimum mass
 
 # --- Hamiltonian Trigger Configuration ---
-H_DIFF_ABS_THR = 0.0075           # Absolute threshold [J] |H_pred - H_real|
+H_DIFF_ABS_THR = 0.002          # Absolute threshold [J] |H_pred - H_real|
 H_DIFF_REL_THR = 0.5              # Relative threshold
 H_EPS_DEN      = 1e-6             
 UNFREEZE_H_HOLD = 20.0            # Unfreeze hold duration [s]
 PLOT_SWITCH_MARK = True           
 
 # --- Adaptation Policies ---
-UNFREEZE_ON_SWITCH = True         
 SILENCE_H_TRIGGERS_UNTIL_ADAPTED = True 
 
 # --- Adaptation Gate Configuration ---
@@ -49,11 +48,11 @@ PRIORITIZE_BY_ERROR      = True
 RECENT_FRACTION          = 0.7
 
 # --- Drift Policy ---
-USE_ONLY_POST_SWITCH     = True
-RESET_BUFFER_ON_SWITCH   = True
+USE_ONLY_POST_ANOMALY     = True
+RESET_BUFFER_ON_ANOMALY   = True
 
 # --- Wheel Offset Configuration ---
-WHEEL_OFFSET_VALUE   = 0.01       # [rad/s]
+WHEEL_OFFSET_VALUE   = 0.02       # [rad/s]
 WHEEL_OFFSET_MODE    = "permanent" # Options: "window", "permanent", "off"
 WHEEL_OFFSET_WINDOW  = 2.0        # [s]
 
@@ -206,11 +205,6 @@ class OnlineBuffer:
 
 # --- Adaptation Gate ---
 class AdaptationGate:
-    """
-    Prevents Hamiltonian-triggered unfreezing until model stabilization criteria are met:
-    1. Minimum post-switch samples acquired.
-    2. EWMA of relative H error remains below threshold for consecutive seconds.
-    """
     def __init__(self, start_time, min_points_post=ONLINE_MIN_POINTS_POST,
                  ewma_thr=ADAPT_EWMA_REL_THR, stable_secs=ADAPT_STABLE_SECS, beta=EWMA_BETA):
         self.start_time = float(start_time)
@@ -288,7 +282,6 @@ class YouBot:
 
 # --- EKF-SNPID Core ---
 def ekf_snpid_freeze(x1, x2, x3, w, P, Q, R, n, alpha, umax, freeze_flag):
-    """Computes the control law and conditionally updates Kalman filter weights."""
     x = np.array([x1,x2,x3], float)
     v = float(w @ x)
     u = alpha * np.tanh(v)
@@ -326,7 +319,7 @@ def ref_original(t, mode):
 # --- Main Execution ---
 def main():
     REF_MODO = "rosa"
-    S        = 200.0  # Total simulation duration [s]
+    S        = 150.0  # Total simulation duration [s]
 
     L = 0.2355
     l = 0.15
@@ -360,7 +353,6 @@ def main():
         try:
             bot.sim.setShapeMass(bot.cuboid, ML_INIT)
         except Exception as e:
-            print(f"[WARNING] Engine rejected 0 mass. Using epsilon. Details: {e}")
             bot.sim.setShapeMass(bot.cuboid, ML_EPS)
             m_L = ML_EPS
     else:
@@ -369,6 +361,9 @@ def main():
     t_switch = (S*0.5) if (ML_SWITCH_T is None) else float(ML_SWITCH_T)
     mass_switched = False
     switch_time_logged = None
+    
+    # Bandera para detectar el choque de forma autónoma
+    autonomous_shock_detected = False 
 
     # Logging structures
     t_log=[]; p_log=[]; pd_log=[]; w_log=[]
@@ -421,15 +416,14 @@ def main():
             t = time.time() - t0
             if t > S: break
 
-            # 1. Dynamic Payload Handling
+            # 1. Dynamic Payload Handling (Aplica el cambio físico, no interfiere con las ganancias)
             if (not mass_switched) and (t >= (t_switch if ML_SWITCH_T is not None else (S*0.5))):
                 if bot.cuboid is not None:
                     try:
                         bot.sim.setShapeMass(bot.cuboid, ML_NEW)
                         print(f"[INFO] Load mass (m_L) changed to {ML_NEW:.6f} kg @ t={t:.2f}s")
                         m_L = ML_NEW
-                    except Exception as e:
-                        print(f"[WARNING] setShapeMass failed. Details: {e}")
+                    except Exception:
                         m_L = ML_NEW
                 else:
                     m_L = ML_NEW
@@ -437,17 +431,6 @@ def main():
                 
                 mass_switched = True
                 switch_time_logged = t
-
-                if UNFREEZE_ON_SWITCH:
-                    freeze_x = freeze_y = freeze_t = False
-                    h_unfreeze_events.append((t, np.nan, np.nan))
-                    start_or_extend_hold(t, UNFREEZE_H_HOLD)
-
-                if RESET_BUFFER_ON_SWITCH:
-                    buffer = OnlineBuffer(capacity=ONLINE_BUFFER_SIZE)
-                    last_update_time = -1e9
-                if USE_ONLY_POST_SWITCH:
-                    train_from_time = t
 
             # 2. State & Reference Update
             xd, yd, thd = ref_original(t, REF_MODO)
@@ -524,14 +507,12 @@ def main():
                 try:
                     Hp = model.predict(X, verbose=0).ravel()[0]
                     H_pred_inst = float(Hp)
-                except Exception as e:
-                    if len(H_pred_list) == 0:
-                        print(f"[WARNING] Online TF prediction failed. Details: {e}")
+                except Exception:
                     H_pred_inst = None
 
             buffer.push(ux, uy, uth, H_real, t, H_pred_inst)
 
-            # 9. Gate Evaluation & Trigger Extension
+            # 9. Gate Evaluation & Trigger Extension (DETECCIÓN AUTÓNOMA)
             if H_pred_inst is not None and np.isfinite(H_pred_inst):
                 diff_abs = abs(H_pred_inst - H_real)
                 denom    = max(abs(H_real), H_EPS_DEN)
@@ -540,21 +521,36 @@ def main():
                 adapt_gate.note_sample(t, True, diff_rel)
 
                 if (diff_abs > H_DIFF_ABS_THR) or (diff_rel > H_DIFF_REL_THR):
-                    if SILENCE_H_TRIGGERS_UNTIL_ADAPTED and (not adapt_gate.is_adapted(t)):
-                        h_trigger_events_gated.append((t, diff_abs, diff_rel))
+                    if not autonomous_shock_detected:
+                        # LA RED DETECTA EL SALTO ENERGÉTICO POR SÍ SOLA
+                        autonomous_shock_detected = True
+                        freeze_x = freeze_y = freeze_t = False
+                        h_unfreeze_events.append((t, diff_abs, diff_rel))
+                        start_or_extend_hold(t, UNFREEZE_H_HOLD)
+                        print(f"[RE-ADAPTATION TRIGGERED] Anomaly autonomously detected at t={t:.2f}s")
+                        
+                        # Reinicio de buffer y estado de red neuronal
+                        if RESET_BUFFER_ON_ANOMALY:
+                            buffer = OnlineBuffer(capacity=ONLINE_BUFFER_SIZE)
+                            last_update_time = -1e9
+                        if USE_ONLY_POST_ANOMALY:
+                            train_from_time = t
+                        adapt_gate = AdaptationGate(start_time=t)
                     else:
+                        # Evaluación estándar post-choque
                         if adapt_gate.allow_unfreeze(t):
                             freeze_x = freeze_y = freeze_t = False
                             h_unfreeze_events.append((t, diff_abs, diff_rel))
                             start_or_extend_hold(t, UNFREEZE_H_HOLD)
                         else:
-                            h_trigger_events_gated.append((t, diff_abs, diff_rel))
+                            if not SILENCE_H_TRIGGERS_UNTIL_ADAPTED:
+                                h_trigger_events_gated.append((t, diff_abs, diff_rel))
 
             # 10. Online Learning Update
             if model is not None and buffer.ready() and (t - last_update_time) >= COOLDOWN_BETWEEN_UPDATES:
                 lr_target = ONLINE_LR_BASE
                 steps = ONLINE_STEPS_POST_ADAPT
-                if t >= t_switch and not adapt_gate.is_adapted(t):
+                if autonomous_shock_detected and not adapt_gate.is_adapted(t):
                     lr_target = ONLINE_LR_WARM
                     steps = ONLINE_STEPS_PRE_ADAPT
                 try:
@@ -563,9 +559,9 @@ def main():
                     pass
                 for _ in range(steps):
                     Xb, yb = buffer.sample(ONLINE_BATCH_SIZE,
-                                           recent_from_t=(train_from_time if USE_ONLY_POST_SWITCH else t_switch),
+                                           recent_from_t=(train_from_time if USE_ONLY_POST_ANOMALY else t_switch),
                                            prioritize_error=PRIORITIZE_BY_ERROR,
-                                           frac_recent=(1.0 if USE_ONLY_POST_SWITCH else RECENT_FRACTION))
+                                           frac_recent=(1.0 if USE_ONLY_POST_ANOMALY else RECENT_FRACTION))
                     if Xb is not None:
                         model.train_on_batch(Xb, yb)
                 last_update_time = t
@@ -621,8 +617,6 @@ def main():
             stdH = np.std(H_log[mask]) + 1e-12
             print(f"[Hamiltonian Comparison] RMSE={rmse:.6e}  MAE={mae:.6e}  R2={r2:.6f}  "
                   f"NRMSE(range)={rmse/rng:.6e}  NRMSE(std)={rmse/stdH:.6e}")
-        else:
-            print("[INFO] Insufficient valid points for Hamiltonian metrics.")
 
     # --- Plotting Subroutines ---
     def mark_switch(ax):
@@ -647,7 +641,7 @@ def main():
         ax = plt.subplot(3,1,i+1); ax.grid(True)
         if pd_log.shape[1]>0: ax.plot(t_log, pd_log[i], '--', lw=1.5, label=f'{lab}_d')
         if p_log.shape[1]>0:  ax.plot(t_log, p_log[i], lw=1.5, label=lab)
-        shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+        shade_hold(ax); mark_switch(ax); 
         ax.set_ylabel(lab)
         if i==2: ax.set_xlabel('t [s]')
         ax.legend(loc='best')
@@ -669,7 +663,7 @@ def main():
     ax.plot(t_log, ux_log, label='u_x')
     ax.plot(t_log, uy_log, label='u_y')
     ax.plot(t_log, uth_log, label='u_θ')
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.set_xlabel('t [s]'); ax.set_ylabel('Control Action'); ax.legend(loc='best')
 
     # Errors
@@ -678,7 +672,7 @@ def main():
     ax.plot(t_log, ex_log, label='e_x')
     ax.plot(t_log, ey_log, label='e_y')
     ax.plot(t_log, eth_log, label='e_θ')
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.set_xlabel('t [s]'); ax.legend(loc='best')
 
     # Normalized Errors
@@ -689,22 +683,22 @@ def main():
     ax.plot(t_log, ethn_log, label='e_{θ,n}')
     ax.axhline(e_thr_freeze, linestyle='--', color= 'k', label='Freeze Threshold')
     ax.axhline(e_thr_unfz,   linestyle='--', color= 'r', label='Unfreeze Threshold')
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.set_xlabel('t [s]'); ax.legend(loc='best')
 
     # Learned Gains
     plt.figure("Learned Gains", figsize=(9,9))
     ax=plt.subplot(3,1,1); ax.grid(True)
     if Wx_log.shape[1]>0: ax.plot(t_log, Wx_log[0], t_log, Wx_log[1], t_log, Wx_log[2])
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.legend(['Kp_x','Kd_x','Ki_x']); ax.set_title('X-Axis Gains')
     ax=plt.subplot(3,1,2); ax.grid(True)
     if Wy_log.shape[1]>0: ax.plot(t_log, Wy_log[0], t_log, Wy_log[1], t_log, Wy_log[2])
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.legend(['Kp_y','Kd_y','Ki_y']); ax.set_title('Y-Axis Gains')
     ax=plt.subplot(3,1,3); ax.grid(True)
     if Wt_log.shape[1]>0: ax.plot(t_log, Wt_log[0], t_log, Wt_log[1], t_log, Wt_log[2])
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.legend([r'Kp_θ',r'Kd_θ',r'Ki_θ']); ax.set_title('Theta Gains'); ax.set_xlabel('t [s]')
 
     # Wheel Velocities
@@ -712,7 +706,7 @@ def main():
         plt.figure("Wheel Velocities (Command)", figsize=(9,4))
         ax = plt.gca(); ax.grid(True)
         for i in range(4): ax.plot(t_log, w_log[i], label=f'v_{i+1}')
-        shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+        shade_hold(ax); mark_switch(ax); 
         ax.set_xlabel('t [s]'); ax.set_ylabel('Velocity [rad/s]'); ax.legend(loc='best')
 
     # Hamiltonian
@@ -721,19 +715,19 @@ def main():
     ax.plot(t_log, H_log, lw=1.2, label='Real H (Physical)')
     if H_pred is not None and np.isfinite(H_pred).any():
         ax.plot(t_log, H_pred, '--', label='Predicted H (TF)')
-    shade_hold(ax); mark_switch(ax); mark_h_events(ax)
+    shade_hold(ax); mark_switch(ax); 
     ax.set_xlabel('t [s]'); ax.set_ylabel('Energy [J]')
     ax.set_title('Canonical Hamiltonian')
     ax.legend(loc='best')
 
-    # Hamiltonian Error
+    # Hamiltonian Error (Valor Absoluto)
     if H_pred is not None and np.isfinite(H_pred).any():
         plt.figure("Hamiltonian Error", figsize=(10,3))
         ax = plt.gca()
-        diff = H_pred - H_log
+        diff = np.abs(H_pred - H_log)  
         ax.plot(t_log, diff)
-        shade_hold(ax); mark_switch(ax); mark_h_events(ax)
-        ax.grid(True); ax.set_xlabel("t [s]"); ax.set_ylabel("H_pred - H_real [J]")
+        shade_hold(ax); mark_switch(ax); 
+        ax.grid(True); ax.set_xlabel("t [s]"); ax.set_ylabel("|H_pred - H_real| [J]")
         ax.set_title("Absolute Hamiltonian Error")
         plt.tight_layout()
 
